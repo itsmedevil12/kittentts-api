@@ -1,167 +1,44 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import Response
-from pydantic import BaseModel
-import soundfile as sf
-import io
-import os
+# ============================================
+# Stage 1: Build dependencies
+# ============================================
+FROM python:3.12-slim AS builder
 
-from kittentts import KittenTTS
-from pydub import AudioSegment
-from pydub.utils import which
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
 
-# Configure pydub to use ffmpeg
-AudioSegment.converter = which("ffmpeg")
+# Create virtual environment
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 
-app = FastAPI(title="KittenTTS API")
+# Copy requirements first for better caching
+WORKDIR /app
+COPY requirements.txt .
 
-# Initialize the model at startup
-model_name = os.environ.get("KITTEN_TTS_MODEL", "KittenML/kitten-tts-mini-0.8")
-m = KittenTTS(model_name)
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Voice mapping from OpenAI-style voices to KittenTTS voices
-VOICE_MAPPING = {
-    # OpenAI-style -> KittenTTS
-    "alloy": "Jasper",
-    "echo": "Bruno",
-    "fable": "Luna",
-    "onyx": "Bruno",
-    "shimmer": "Kiki",
-    # Direct mapping for KittenTTS voices
-    "Jasper": "Jasper",
-    "Bella": "Bella",
-    "Luna": "Luna",
-    "Bruno": "Bruno",
-    "Rosie": "Rosie",
-    "Hugo": "Hugo",
-    "Kiki": "Kiki",
-    "Leo": "Leo",
-}
+# ============================================
+# Stage 2: Production image
+# ============================================
+FROM python:3.12-slim
 
-DEFAULT_VOICE = "Jasper"
-SAMPLE_RATE = 24000
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
 
+# Copy virtual environment from builder
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 
-class TTSRequest(BaseModel):
-    model: str = "tts-1"
-    input: str
-    voice: str = DEFAULT_VOICE
-    response_format: str = "wav"
-    speed: float = 1.0
-    stream_format: str = "audio"
+# Copy application files
+WORKDIR /app
+COPY main.py .
 
+# Expose port
+EXPOSE 8000
 
-def convert_audio(audio_data, output_format: str, sample_rate: int = SAMPLE_RATE):
-    """Convert audio to the requested format."""
-
-    # First, write audio to WAV buffer
-    wav_buffer = io.BytesIO()
-    sf.write(wav_buffer, audio_data, sample_rate, format='WAV')
-    wav_buffer.seek(0)
-
-    # Load as pydub AudioSegment
-    audio_segment = AudioSegment.from_wav(wav_buffer)
-
-    # Convert to requested format
-    output_buffer = io.BytesIO()
-
-    if output_format == "mp3":
-        audio_segment.export(output_buffer, format="mp3", bitrate="128k")
-        media_type = "audio/mpeg"
-        extension = "mp3"
-    elif output_format == "wav":
-        output_buffer = wav_buffer
-        media_type = "audio/wav"
-        extension = "wav"
-    elif output_format == "ogg":
-        audio_segment.export(output_buffer, format="ogg", bitrate="128k")
-        media_type = "audio/ogg"
-        extension = "ogg"
-    else:
-        raise ValueError(f"Unsupported format: {output_format}")
-
-    output_buffer.seek(0)
-    return output_buffer, media_type, extension
-
-
-@app.post("/v1/audio/speech")
-async def create_speech(request: TTSRequest):
-    """OpenAI-compatible TTS endpoint."""
-
-    # Validate input
-    if not request.input:
-        raise HTTPException(status_code=400, detail="Input text is required")
-
-    # Validate format
-    supported_formats = ["wav", "mp3", "ogg"]
-    if request.response_format not in supported_formats:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported format. Supported: {', '.join(supported_formats)}"
-        )
-
-    if request.stream_format != "audio":
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported stream format. Supported: audio"
-        )
-
-    # Map voice to available voice
-    mapped_voice = VOICE_MAPPING.get(request.voice, DEFAULT_VOICE)
-
-    try:
-        # Generate audio
-        audio = m.generate(request.input, voice=mapped_voice,
-                           speed=request.speed)
-
-        # Convert to requested format
-        audio_buffer, media_type, extension = convert_audio(
-            audio,
-            request.response_format,
-            SAMPLE_RATE
-        )
-
-        return Response(
-            content=audio_buffer.read(),
-            media_type=media_type,
-            headers={
-                "Content-Disposition": f"attachment; filename=speech.{extension}"
-            }
-        )
-
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"TTS generation failed: {str(e)}")
-
-
-@app.get("/v1/models")
-async def list_models():
-    """List available models (for compatibility)."""
-    return {
-        "object": "list",
-        "data": [
-            {"id": "tts-1", "object": "model", "created": 0, "owned_by": "kitten"},
-            {"id": "tts-1-hd", "object": "model",
-                "created": 0, "owned_by": "kitten"},
-        ]
-    }
-
-
-@app.get("/v1/voices")
-async def list_voices():
-    """List available voices."""
-    voices = list(VOICE_MAPPING.keys())
-    return {
-        "object": "list",
-        "data": [
-            {"id": voice, "name": voice.title(), "object": "voice"}
-            for voice in voices
-        ]
-    }
-
-
-@app.get("/health")
-async def health_check():
-    """Health check endpoint."""
-    return {"status": "healthy"}
+# Run the application
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
